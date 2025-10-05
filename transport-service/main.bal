@@ -1,11 +1,24 @@
 import ballerina/http;
 import ballerina/io;
+import ballerina/sql;
+import ballerinax/postgresql;
+import ballerinax/postgresql.driver as _;
+import ballerinax/kafka;
+
+// --- Configuration ---
+
+configurable string dbHost = "localhost";
+configurable int dbPort = 5432;
+configurable string dbName = "transport_db";
+configurable string dbUser = "postgres";
+configurable string dbPassword = "postgres";
+configurable string kafkaBootstrapServers = "localhost:9096";
 
 // --- Records for Data Structures ---
 
 // Represents a transport route.
 type Route record {|
-    readonly int id;
+    int id;
     string origin;
     string destination;
     string transportType; // "Bus" or "Train"
@@ -13,27 +26,30 @@ type Route record {|
 
 // Represents a specific trip on a route.
 type Trip record {|
-    readonly int id;
+    int id;
     int routeId;
     string departureTime;
     string arrivalTime;
     decimal price;
 |};
 
-// --- In-Memory Data Store ---
+// --- Database Client ---
 
-table<Route> key(id) routeTable = table [
-    {id: 1, origin: "Windhoek CBD", destination: "Katutura", transportType: "Bus"},
-    {id: 2, origin: "Eros Airport", destination: "Klein Windhoek", transportType: "Bus"}
-];
-int nextRouteId = 3;
+final postgresql:Client dbClient = check new (
+    host = dbHost,
+    port = dbPort,
+    database = dbName,
+    username = dbUser,
+    password = dbPassword
+);
 
-table<Trip> key(id) tripTable = table [
-    {id: 101, routeId: 1, departureTime: "2025-10-05T08:00:00Z", arrivalTime: "2025-10-05T08:45:00Z", price: 15.50},
-    {id: 102, routeId: 1, departureTime: "2025-10-05T09:00:00Z", arrivalTime: "2025-10-05T09:45:00Z", price: 15.50},
-    {id: 201, routeId: 2, departureTime: "2025-10-05T10:00:00Z", arrivalTime: "2025-10-05T10:20:00Z", price: 25.00}
-];
-int nextTripId = 202;
+// --- Kafka Producer ---
+
+final kafka:Producer kafkaProducer = check new (kafkaBootstrapServers, {
+    clientId: "transport-service-producer",
+    acks: kafka:ACKS_ALL,
+    retryCount: 3
+});
 
 // --- Service Implementation ---
 
@@ -43,8 +59,10 @@ service /transport on new http:Listener(9091) {
 
     // Gets all available routes.
     // GET /transport/routes
-    resource function get routes() returns Route[] {
-        return routeTable.toArray();
+    resource function get routes() returns Route[]|error {
+        stream<Route, sql:Error?> routeStream = dbClient->query(`SELECT id, origin, destination, transport_type as transportType FROM routes`);
+        Route[] routes = check from Route route in routeStream select route;
+        return routes;
     }
 
     // Creates a new route (for admins).
@@ -55,17 +73,38 @@ service /transport on new http:Listener(9091) {
             return <http:BadRequest>{ body: "Invalid route payload" };
         }
 
-        lock {
+        sql:ExecutionResult result = check dbClient->execute(`
+            INSERT INTO routes (origin, destination, transport_type) 
+            VALUES (${route.origin}, ${route.destination}, ${route.transportType})
+        `);
+        
+        int|string? lastInsertId = result.lastInsertId;
+        if lastInsertId is int {
             Route newRoute = {
-                id: nextRouteId,
+                id: lastInsertId,
                 origin: route.origin,
                 destination: route.destination,
                 transportType: route.transportType
             };
-            routeTable.add(newRoute);
             io:println("New Route Created: ", newRoute);
-            nextRouteId += 1;
+            
+            // Publish RouteCreated event to Kafka
+            json routeEvent = {
+                eventType: "RouteCreated",
+                routeId: lastInsertId,
+                origin: newRoute.origin,
+                destination: newRoute.destination,
+                transportType: newRoute.transportType
+            };
+            
+            check kafkaProducer->send({
+                topic: "transport-events",
+                value: routeEvent.toJsonString().toBytes()
+            });
+            
             return <http:Created>{ body: newRoute };
+        } else {
+            return <http:BadRequest>{ body: "Failed to create route" };
         }
     }
 
@@ -73,12 +112,15 @@ service /transport on new http:Listener(9091) {
 
     // Gets all trips, optionally filtered by routeId.
     // GET /transport/trips?routeId={id}
-    resource function get trips(int? routeId) returns Trip[] {
+    resource function get trips(int? routeId) returns Trip[]|error {
+        stream<Trip, sql:Error?> tripStream;
         if routeId is () {
-            return tripTable.toArray();
+            tripStream = dbClient->query(`SELECT id, route_id as routeId, departure_time as departureTime, arrival_time as arrivalTime, price FROM trips`);
         } else {
-            return from var trip in tripTable where trip.routeId == routeId select trip;
+            tripStream = dbClient->query(`SELECT id, route_id as routeId, departure_time as departureTime, arrival_time as arrivalTime, price FROM trips WHERE route_id = ${routeId}`);
         }
+        Trip[] trips = check from Trip trip in tripStream select trip;
+        return trips;
     }
 
     // Creates a new trip for a route (for admins).
@@ -89,18 +131,40 @@ service /transport on new http:Listener(9091) {
             return <http:BadRequest>{ body: "Invalid trip payload" };
         }
 
-        lock {
+        sql:ExecutionResult result = check dbClient->execute(`
+            INSERT INTO trips (route_id, departure_time, arrival_time, price) 
+            VALUES (${trip.routeId}, ${trip.departureTime}, ${trip.arrivalTime}, ${trip.price})
+        `);
+        
+        int|string? lastInsertId = result.lastInsertId;
+        if lastInsertId is int {
             Trip newTrip = {
-                id: nextTripId,
+                id: lastInsertId,
                 routeId: trip.routeId,
                 departureTime: trip.departureTime,
                 arrivalTime: trip.arrivalTime,
                 price: trip.price
             };
-            tripTable.add(newTrip);
             io:println("New Trip Created: ", newTrip);
-            nextTripId += 1;
+            
+            // Publish TripCreated event to Kafka
+            json tripEvent = {
+                eventType: "TripCreated",
+                tripId: lastInsertId,
+                routeId: newTrip.routeId,
+                departureTime: newTrip.departureTime,
+                arrivalTime: newTrip.arrivalTime,
+                price: newTrip.price
+            };
+            
+            check kafkaProducer->send({
+                topic: "transport-events",
+                value: tripEvent.toJsonString().toBytes()
+            });
+            
             return <http:Created>{ body: newTrip };
+        } else {
+            return <http:BadRequest>{ body: "Failed to create trip" };
         }
     }
 }

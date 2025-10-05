@@ -1,0 +1,259 @@
+version: '3.8'
+
+services:
+  # Kafka Infrastructure
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - transport-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9096:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - transport-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # PostgreSQL Databases
+  passenger-db:
+    image: postgres:16-alpine
+    container_name: passenger-db
+    environment:
+      POSTGRES_DB: passenger_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - passenger-data:/var/lib/postgresql/data
+      - ./passenger-service/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - transport-network
+
+  transport-db:
+    image: postgres:16-alpine
+    container_name: transport-db
+    environment:
+      POSTGRES_DB: transport_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - transport-data:/var/lib/postgresql/data
+      - ./transport-service/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - transport-network
+
+  ticketing-db:
+    image: postgres:16-alpine
+    container_name: ticketing-db
+    environment:
+      POSTGRES_DB: ticketing_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - ticketing-data:/var/lib/postgresql/data
+      - ./ticketing-service/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - transport-network
+
+  notification-db:
+    image: postgres:16-alpine
+    container_name: notification-db
+    environment:
+      POSTGRES_DB: notification_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5435:5432"
+    volumes:
+      - notification-data:/var/lib/postgresql/data
+      - ./notification-service/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - transport-network
+
+  # Microservices
+  passenger-service:
+    build:
+      context: ./passenger-service
+      dockerfile: Dockerfile
+    container_name: passenger-service
+    environment:
+      - dbHost=passenger-db
+      - dbPort=5432
+      - dbName=passenger_db
+      - dbUser=postgres
+      - dbPassword=postgres
+      - kafkaBootstrapServers=kafka:29092
+    ports:
+      - "9090:9090"
+    depends_on:
+      passenger-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  transport-service:
+    build:
+      context: ./transport-service
+      dockerfile: Dockerfile
+    container_name: transport-service
+    environment:
+      - dbHost=transport-db
+      - dbPort=5432
+      - dbName=transport_db
+      - dbUser=postgres
+      - dbPassword=postgres
+      - kafkaBootstrapServers=kafka:29092
+    ports:
+      - "9091:9091"
+    depends_on:
+      transport-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  ticketing-service:
+    build:
+      context: ./ticketing-service
+      dockerfile: Dockerfile
+    container_name: ticketing-service
+    environment:
+      - dbHost=ticketing-db
+      - dbPort=5432
+      - dbName=ticketing_db
+      - dbUser=postgres
+      - dbPassword=postgres
+      - kafkaBootstrapServers=kafka:29092
+    ports:
+      - "9092:9092"
+    depends_on:
+      ticketing-db:
+        condition: service_healthy
+      payment-service:
+        condition: service_started
+      notification-service:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  payment-service:
+    build:
+      context: ./payment-service
+      dockerfile: Dockerfile
+    container_name: payment-service
+    ports:
+      - "9093:9093"
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    environment:
+      - dbHost=notification-db
+      - dbPort=5432
+      - dbName=notification_db
+      - dbUser=postgres
+      - dbPassword=postgres
+      - kafkaBootstrapServers=kafka:29092
+    ports:
+      - "9094:9094"
+    depends_on:
+      notification-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  admin-service:
+    build:
+      context: ./admin-service
+      dockerfile: Dockerfile
+    container_name: admin-service
+    ports:
+      - "9095:9095"
+    depends_on:
+      - transport-service
+      - ticketing-service
+      - notification-service
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+networks:
+  transport-network:
+    driver: bridge
+
+volumes:
+  passenger-data:
+  transport-data:
+  ticketing-data:
+  notification-data:
+

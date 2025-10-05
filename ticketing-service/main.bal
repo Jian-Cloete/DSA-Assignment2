@@ -1,6 +1,19 @@
 import ballerina/http;
 import ballerina/io;
 import ballerina/time;
+import ballerina/sql;
+import ballerinax/postgresql;
+import ballerinax/postgresql.driver as _;
+import ballerinax/kafka;
+
+// --- Configuration ---
+
+configurable string dbHost = "localhost";
+configurable int dbPort = 5432;
+configurable string dbName = "ticketing_db";
+configurable string dbUser = "postgres";
+configurable string dbPassword = "postgres";
+configurable string kafkaBootstrapServers = "localhost:9096";
 
 // --- Records for Data Structures ---
 
@@ -14,22 +27,35 @@ type TicketRequest record {|
 
 // Represents a ticket purchased by a passenger.
 type Ticket record {|
-    readonly int id;
+    int id;
     int passengerId;
     int tripId;
     decimal price;
-    TicketStatus status;
+    string status;
     string purchasedAt;
 |};
 
-// --- In-Memory Data Store ---
+// --- Database Client ---
 
-table<Ticket> key(id) ticketTable = table [];
-int nextTicketId = 1;
+final postgresql:Client dbClient = check new (
+    host = dbHost,
+    port = dbPort,
+    database = dbName,
+    username = dbUser,
+    password = dbPassword
+);
 
 // --- HTTP Client for Inter-Service Communication ---
 final http:Client paymentServiceClient = check new("http://localhost:9093");
 final http:Client notificationServiceClient = check new("http://localhost:9094");
+
+// --- Kafka Producer ---
+
+final kafka:Producer kafkaProducer = check new (kafkaBootstrapServers, {
+    clientId: "ticketing-service-producer",
+    acks: kafka:ACKS_ALL,
+    retryCount: 3
+});
 
 // --- Service Implementation ---
 
@@ -46,50 +72,70 @@ service /tickets on new http:Listener(9092) {
         }
 
         // 1. Create the ticket with "CREATED" status.
-        Ticket newTicket;
-        lock {
-            newTicket = {
-                id: nextTicketId,
-                passengerId: ticketRequest.passengerId,
-                tripId: ticketRequest.tripId,
-                price: ticketRequest.price,
-                status: "CREATED",
-                purchasedAt: time:utcToString(time:utcNow())
-            };
-            ticketTable.add(newTicket);
-            nextTicketId += 1;
+        string purchasedAt = time:utcToString(time:utcNow());
+        sql:ExecutionResult result = check dbClient->execute(`
+            INSERT INTO tickets (passenger_id, trip_id, price, status, purchased_at) 
+            VALUES (${ticketRequest.passengerId}, ${ticketRequest.tripId}, ${ticketRequest.price}, 'CREATED', ${purchasedAt})
+        `);
+        
+        int|string? lastInsertId = result.lastInsertId;
+        if lastInsertId !is int {
+            return <http:BadRequest>{ body: "Failed to create ticket" };
         }
-        io:println("Ticket Created (Pending Payment): ", newTicket);
+        
+        int ticketId = lastInsertId;
+        io:println("Ticket Created (Pending Payment): ID ", ticketId);
 
         // 2. Call Payment Service to process the payment.
         json paymentPayload = {
-            ticketId: newTicket.id,
-            amount: newTicket.price
+            ticketId: ticketId,
+            amount: ticketRequest.price
         };
         http:Response|error paymentResponse = paymentServiceClient->/payments.post(paymentPayload);
 
         if paymentResponse is http:Response && paymentResponse.statusCode == 200 {
             // 3. Update ticket status to "PAID" on successful payment.
-            lock {
-                newTicket.status = "PAID";
-                ticketTable.put(newTicket);
-            }
-            io:println("Ticket Paid: ", newTicket);
+            _ = check dbClient->execute(`UPDATE tickets SET status = 'PAID' WHERE id = ${ticketId}`);
+            io:println("Ticket Paid: ID ", ticketId);
 
              // 4. Send a notification.
             json notificationPayload = {
-                passengerId: newTicket.passengerId,
-                message: string `Your ticket for trip ${newTicket.tripId} has been confirmed.`
+                passengerId: ticketRequest.passengerId,
+                message: string `Your ticket for trip ${ticketRequest.tripId} has been confirmed.`
             };
             http:Response|error notifResponse = notificationServiceClient->/notifications.post(notificationPayload);
             if notifResponse is error {
                 io:println("Error sending notification: ", notifResponse);
             }
 
+            Ticket newTicket = {
+                id: ticketId,
+                passengerId: ticketRequest.passengerId,
+                tripId: ticketRequest.tripId,
+                price: ticketRequest.price,
+                status: "PAID",
+                purchasedAt: purchasedAt
+            };
+            
+            // Publish TicketPurchased event to Kafka
+            json ticketEvent = {
+                eventType: "TicketPurchased",
+                ticketId: ticketId,
+                passengerId: ticketRequest.passengerId,
+                tripId: ticketRequest.tripId,
+                price: ticketRequest.price,
+                timestamp: purchasedAt
+            };
+            
+            check kafkaProducer->send({
+                topic: "ticket-events",
+                value: ticketEvent.toJsonString().toBytes()
+            });
+            
             return <http:Created>{ body: newTicket };
         } else {
             // Handle payment failure.
-            io:println("Payment failed for ticket ID: ", newTicket.id);
+            io:println("Payment failed for ticket ID: ", ticketId);
             if paymentResponse is error {
                  return <http:InternalServerError>{ body: "Payment service is unavailable: " + paymentResponse.toString() };
             } else {
@@ -101,17 +147,17 @@ service /tickets on new http:Listener(9092) {
     // Validates a ticket (e.g., when boarding a bus).
     // POST /tickets/{id}/validate
     resource function post [int id]/validate() returns http:Ok|http:NotFound|http:Conflict|error {
-        Ticket? ticket = ticketTable[id];
-        if ticket is () {
+        stream<Ticket, sql:Error?> ticketStream = dbClient->query(`SELECT id, passenger_id as passengerId, trip_id as tripId, price, status, purchased_at as purchasedAt FROM tickets WHERE id = ${id}`);
+        Ticket[] tickets = check from Ticket ticket in ticketStream select ticket;
+        
+        if tickets.length() == 0 {
             return <http:NotFound>{ body: string `Ticket with ID ${id} not found` };
         }
-
+        
+        Ticket ticket = tickets[0];
         if ticket.status == "PAID" {
-            lock {
-                ticket.status = "VALIDATED";
-                ticketTable.put(ticket);
-            }
-            io:println("Ticket Validated: ", ticket);
+            _ = check dbClient->execute(`UPDATE tickets SET status = 'VALIDATED' WHERE id = ${id}`);
+            io:println("Ticket Validated: ID ", id);
 
             // Send notification about validation.
             json notificationPayload = {
@@ -123,6 +169,22 @@ service /tickets on new http:Listener(9092) {
                 io:println("Error sending notification: ", notifRes);
             }
 
+            ticket.status = "VALIDATED";
+            
+            // Publish TicketValidated event to Kafka
+            json validationEvent = {
+                eventType: "TicketValidated",
+                ticketId: id,
+                passengerId: ticket.passengerId,
+                tripId: ticket.tripId,
+                timestamp: time:utcToString(time:utcNow())
+            };
+            
+            check kafkaProducer->send({
+                topic: "ticket-events",
+                value: validationEvent.toJsonString().toBytes()
+            });
+            
             return <http:Ok>{ body: ticket };
         } else {
             string message = string `Ticket cannot be validated. Current status: ${ticket.status}`;
@@ -133,17 +195,21 @@ service /tickets on new http:Listener(9092) {
 
     // Gets a ticket's details by ID.
     // GET /tickets/{id}
-    resource function get [int id]() returns Ticket|http:NotFound {
-        Ticket? ticket = ticketTable[id];
-        if ticket is () {
-            return { body: string `Ticket with ID ${id} not found` };
+    resource function get [int id]() returns Ticket|http:NotFound|error {
+        stream<Ticket, sql:Error?> ticketStream = dbClient->query(`SELECT id, passenger_id as passengerId, trip_id as tripId, price, status, purchased_at as purchasedAt FROM tickets WHERE id = ${id}`);
+        Ticket[] tickets = check from Ticket ticket in ticketStream select ticket;
+        
+        if tickets.length() == 0 {
+            return <http:NotFound>{ body: string `Ticket with ID ${id} not found` };
         }
-        return ticket;
+        return tickets[0];
     }
 
     // Gets all tickets (for admin/reporting purposes).
     // GET /tickets
-    resource function get all() returns Ticket[] {
-        return ticketTable.toArray();
+    resource function get all() returns Ticket[]|error {
+        stream<Ticket, sql:Error?> ticketStream = dbClient->query(`SELECT id, passenger_id as passengerId, trip_id as tripId, price, status, purchased_at as purchasedAt FROM tickets`);
+        Ticket[] tickets = check from Ticket ticket in ticketStream select ticket;
+        return tickets;
     }
 }

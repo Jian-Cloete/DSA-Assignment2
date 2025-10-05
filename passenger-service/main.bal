@@ -1,5 +1,19 @@
 import ballerina/http;
 import ballerina/io;
+import ballerina/sql;
+import ballerina/time;
+import ballerinax/postgresql;
+import ballerinax/postgresql.driver as _;
+import ballerinax/kafka;
+
+// --- Configuration ---
+
+configurable string dbHost = "localhost";
+configurable int dbPort = 5432;
+configurable string dbName = "passenger_db";
+configurable string dbUser = "postgres";
+configurable string dbPassword = "postgres";
+configurable string kafkaBootstrapServers = "localhost:9096";
 
 // --- Records for Data Structures ---
 
@@ -10,18 +24,29 @@ type LoginRequest record {|
 
 // Represents a passenger in the system.
 type Passenger record {|
-    readonly int id;
+    int id;
     string name;
     string email;
     string password;
 |};
 
-// --- In-Memory Data Store ---
+// --- Database Client ---
 
-// In-memory table to store passenger data.
-// The 'id' field is the primary key.
-table<Passenger> key(id) passengerTable = table [];
-int nextPassengerId = 1;
+final postgresql:Client dbClient = check new (
+    host = dbHost,
+    port = dbPort,
+    database = dbName,
+    username = dbUser,
+    password = dbPassword
+);
+
+// --- Kafka Producer ---
+
+final kafka:Producer kafkaProducer = check new (kafkaBootstrapServers, {
+    clientId: "passenger-service-producer",
+    acks: kafka:ACKS_ALL,
+    retryCount: 3
+});
 
 // --- Service Implementation ---
 
@@ -45,18 +70,39 @@ service /passengers on new http:Listener(9090) {
         string email = emailJson.toString();
         string password = passwordJson.toString();
 
-        // Create and add the new passenger.
-        lock {
+        // Insert into database
+        sql:ExecutionResult result = check dbClient->execute(`
+            INSERT INTO passengers (name, email, password) 
+            VALUES (${name}, ${email}, ${password})
+        `);
+        
+        int|string? lastInsertId = result.lastInsertId;
+        if lastInsertId is int {
             Passenger newPassenger = {
-                id: nextPassengerId,
+                id: lastInsertId,
                 name: name,
                 email: email,
-                password: password // In a real app, this should be hashed.
+                password: password
             };
-            passengerTable.add(newPassenger);
             io:println("Passenger Registered: ", newPassenger);
-            nextPassengerId += 1;
+            
+            // Publish PassengerRegistered event to Kafka
+            json event = {
+                eventType: "PassengerRegistered",
+                passengerId: newPassenger.id,
+                name: newPassenger.name,
+                email: newPassenger.email,
+                timestamp: time:utcToString(time:utcNow())
+            };
+            
+            check kafkaProducer->send({
+                topic: "passenger-events",
+                value: event.toJsonString().toBytes()
+            });
+            
             return <http:Created>{ body: newPassenger, headers: {"Location": string `/passengers/${newPassenger.id}`} };
+        } else {
+            return <http:BadRequest>{ body: "Failed to register passenger" };
         }
     }
 
@@ -69,17 +115,18 @@ service /passengers on new http:Listener(9090) {
             return <http:Unauthorized>{ body: "Invalid login payload. Requires email and password." };
         }
 
-        // Find passenger by email.
-        var foundPassenger = from var p in passengerTable
-                              where p.email == credentials.email
-                              select p;
-
-        // In Ballerina, iterating even for one result is standard.
-        foreach var p in foundPassenger {
-            if p.password == credentials.password {
-                io:println("Login successful for: ", p.email);
-                return <http:Ok>{ body: {"message": "Login successful", "passengerId": p.id} };
-            }
+        // Find passenger by email and password
+        stream<Passenger, sql:Error?> passengerStream = dbClient->query(
+            `SELECT id, name, email, password FROM passengers 
+             WHERE email = ${credentials.email} AND password = ${credentials.password}`
+        );
+        
+        Passenger[] passengers = check from Passenger passenger in passengerStream select passenger;
+        
+        if passengers.length() > 0 {
+            Passenger p = passengers[0];
+            io:println("Login successful for: ", p.email);
+            return <http:Ok>{ body: {"message": "Login successful", "passengerId": p.id} };
         }
 
         io:println("Login failed for: ", credentials.email);
@@ -89,10 +136,16 @@ service /passengers on new http:Listener(9090) {
     // Gets passenger details by ID.
     // GET /passengers/{id}
     resource function get [int id]() returns Passenger|http:NotFound|error {
-        Passenger? passenger = passengerTable[id];
-        if passenger is () {
-            return <http:NotFound>{ body: string `Passenger with ID ${id} not found` };
+        stream<Passenger, sql:Error?> passengerStream = dbClient->query(
+            `SELECT id, name, email, password FROM passengers WHERE id = ${id}`
+        );
+        
+        Passenger[] passengers = check from Passenger passenger in passengerStream select passenger;
+        
+        if passengers.length() > 0 {
+            return passengers[0];
         }
-        return passenger;
+        
+        return <http:NotFound>{ body: string `Passenger with ID ${id} not found` };
     }
 }
