@@ -1,9 +1,9 @@
-
-
 # DSA-Assignment2 — Smart Public Transport Ticketing System
 
 **Course:** DSA612S — Distributed Systems and Applications
 **Assignment:** 2 
+
+
 **Group Members:**
 
 * Rejoice Kaulumah – 224061135
