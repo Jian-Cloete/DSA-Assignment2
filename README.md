@@ -121,20 +121,24 @@ bal run main.bal
   `passenger → ticketing → payment → notification → transport → admin`
 
 ### 4. Test Endpoints
-
-* Example curl commands:
+- Example curl commands for ticket flow (create → pay → validate):
 
 ```bash
-# Register a passenger
-curl -X POST http://localhost:8081/passenger/register \
--H "Content-Type: application/json" \
--d '{"username":"Rejoice","email":"r@example.com","password":"1234"}'
-
 # Create a ticket
-curl -X POST http://localhost:8080/tickets/create \
+curl -s -X POST http://localhost:8080/tickets/create \
 -H "Content-Type: application/json" \
--d '{"user_id":1,"trip_id":1,"ticket_type":"single","price":10.0}'
-```
+-d '{"user_id":1,"trip_id":1,"ticket_type":"single","price":10.0}' | jq
+
+# Pay for the ticket
+curl -s -X POST http://localhost:8080/tickets/pay \
+-H "Content-Type: application/json" \
+-d '{"ticket_id":1,"amount":10.0,"provider_ref":"sim"}' | jq
+
+# Validate the ticket
+curl -s -X POST http://localhost:8080/tickets/validate \
+-H "Content-Type: application/json" \
+-d '{"ticket_id":1}' | jq
+
 
 * Flow: **register → create ticket → pay → validate → notifications → admin reports**
 
