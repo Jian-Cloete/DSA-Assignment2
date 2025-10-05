@@ -1,8 +1,11 @@
 # DSA-Assignment2 — Smart Public Transport Ticketing System
 
 **Course:** DSA612S — Distributed Systems and Applications
+**Institution:** Namibia University of Science and Technology (NUST)
+**Released:** 19 September 2025 
+**Deadline:** 05 October 2025, 23:59 
+**Total Marks:** 100
 **Assignment:** 2 
-
 
 **Group Members:**
 
